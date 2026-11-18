@@ -1,0 +1,159 @@
+# Builds an unsigned Firefox for iOS IPA (device build, arm64) on a GitHub-hosted
+# macOS runner, ready to be re-signed and installed by SideStore.
+#
+# Run it from the Actions tab -> "Build Firefox iOS IPA" -> Run workflow.
+# Output: an artifact named firefox-ios-<ref> that contains Firefox.ipa.
+
+name: Build Firefox iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "firefox-ios tag or branch to build (see github.com/mozilla-mobile/firefox-ios/releases)"
+        required: true
+        default: "firefox-v160.1"
+      team_id:
+        description: "Your Apple Team ID (10 chars, see notes). Optional, but without it saved logins / Firefox Sync can't use the keychain"
+        required: false
+        default: ""
+      display_name:
+        description: "Home-screen name, so you can tell it apart from the App Store Firefox"
+        required: true
+        default: "Firefox 2"
+      keep_extensions:
+        description: "Keep app extensions (widgets, share sheet, password autofill...). Each one uses up a free-account App ID"
+        type: boolean
+        default: false
+      xcode_version:
+        description: "Xcode version (must match the badge in the firefox-ios README for that ref)"
+        required: true
+        default: "27.1"
+
+jobs:
+  build:
+    # Xcode 27 is only on the "xcode-27" image (public preview as of Nov 2026).
+    # If GitHub renames it, use whichever macOS image lists the Xcode you need:
+    # https://github.com/actions/runner-images#available-images
+    runs-on: xcode-27
+    timeout-minutes: 300
+    env:
+      SRC: ${{ github.workspace }}/src
+      DD: ${{ github.workspace }}/DerivedData
+      CONFIG: Firefox # the release build configuration (optimized, bundle id org.mozilla.ios.Firefox)
+
+    steps:
+      - name: Check out firefox-ios
+        uses: actions/checkout@v4
+        with:
+          repository: mozilla-mobile/firefox-ios
+          ref: ${{ inputs.ref }}
+          path: src
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode_version }}.app/Contents/Developer"
+          xcodebuild -version
+
+      - name: Bootstrap (same steps Mozilla's own CI runs)
+        working-directory: src
+        run: |
+          ./bootstrap.sh focus
+          ./bootstrap.sh firefox --force
+
+      - name: Resolve Swift packages
+        working-directory: src/firefox-ios
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Client.xcodeproj -scheme Firefox \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackagePluginValidation -skipMacroValidation
+
+      - name: Build for device (unsigned)
+        working-directory: src/firefox-ios
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Client.xcodeproj \
+            -scheme Firefox \
+            -configuration "$CONFIG" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DD" \
+            -skipPackagePluginValidation -skipMacroValidation \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E '(error|warning: .*fatal|BUILD (SUCCEEDED|FAILED)|\*\*)' || true
+          grep -q 'BUILD SUCCEEDED' "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          retention-days: 7
+
+      - name: Patch, fake-sign and package IPA
+        env:
+          TEAM_ID: ${{ inputs.team_id }}
+          DISPLAY_NAME: ${{ inputs.display_name }}
+          KEEP_EXTENSIONS: ${{ inputs.keep_extensions }}
+        run: |
+          set -euo pipefail
+          PB=/usr/libexec/PlistBuddy
+
+          APP=$(find "$DD/Build/Products/$CONFIG-iphoneos" -maxdepth 1 -name '*.app' -print -quit)
+          [ -n "$APP" ] || { echo "No .app found"; ls -la "$DD/Build/Products"; exit 1; }
+          echo "Built app: $APP"
+
+          # Optionally drop extensions so the app costs a single App ID on a free account.
+          if [ "$KEEP_EXTENSIONS" != "true" ]; then
+            rm -rf "$APP/PlugIns" "$APP/Extensions"
+          fi
+
+          # Home-screen name.
+          $PB -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$APP/Info.plist" \
+            || $PB -c "Add :CFBundleDisplayName string $DISPLAY_NAME" "$APP/Info.plist"
+
+          # Firefox builds its keychain access group as "<MozDevelopmentTeam>.<bundle id>".
+          # It ships with Mozilla's team ID; point it at yours so it matches what SideStore signs with.
+          if [ -n "$TEAM_ID" ]; then
+            for plist in "$APP/Info.plist" "$APP"/PlugIns/*.appex/Info.plist; do
+              [ -f "$plist" ] && $PB -c "Set :MozDevelopmentTeam $TEAM_ID" "$plist" || true
+            done
+          fi
+
+          # Embed the app-group entitlement so SideStore registers the group on your account.
+          # (Firefox derives the group from its bundle id, and SideStore appends your team ID to both.)
+          cat > "$RUNNER_TEMP/ents.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.application-groups</key>
+            <array>
+              <string>group.org.mozilla.ios.Firefox</string>
+            </array>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$RUNNER_TEMP/ents.plist"
+
+          brew install ldid
+          sign() { ldid -S"$RUNNER_TEMP/ents.plist" "$1/$($PB -c 'Print :CFBundleExecutable' "$1/Info.plist")"; }
+          for appex in "$APP"/PlugIns/*.appex; do [ -d "$appex" ] && sign "$appex"; done
+          sign "$APP"
+
+          mkdir -p "$RUNNER_TEMP/out/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/out/Payload/"
+          (cd "$RUNNER_TEMP/out" && zip -qry Firefox.ipa Payload)
+          ls -lh "$RUNNER_TEMP/out/Firefox.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: firefox-ios-${{ inputs.ref }}
+          path: ${{ runner.temp }}/out/Firefox.ipa
+          retention-days: 14
